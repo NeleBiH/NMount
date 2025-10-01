@@ -64,7 +64,7 @@ sudo pacman -S udisks2 polkit util-linux parted
 ## Install (Dev / Run from source)
 
 ```bash
-git clone https://github.com/<youruser>/NMount.git
+git clone https://github.com/NeleBiH/NMount.git
 cd NMount
 python3 -m venv .venv
 source .venv/bin/activate
