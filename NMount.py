@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NMount - simple ISO mounter with tray, DnD, installer, autostart, i18n, themes,
-one-click polkit 'Fix permissions', desktop shortcut, Help/License popups,
-'last mounted' persistence/restore, Ubuntu isohybrid mount fix,
-failsafe unmount on uninstall, and graceful self-termination on uninstall.
+NMount - A simple, secure Linux GUI tool for mounting/unmounting ISO images.
 
-Default UI language: English. Live language & theme switching.
+Features:
+- Drag & drop or browse for ISO files
+- System tray with Show/Exit
+- Install/Uninstall to ~/.local/bin with desktop integration
+- PolicyKit integration for passwordless mounting
+- Mounted ISOs list with quick access
+- Recent files history
+- Open mount point in file manager
+- SHA-256 checksum verification
+- Auto-unmount on exit
+- Live language switching (English/Croatian)
+- Failsafe unmount on uninstall
+
+License: MIT
 """
 
 import os
@@ -17,6 +27,7 @@ import argparse
 import subprocess
 import getpass
 import signal
+import hashlib
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QTimer, QUrl
@@ -24,7 +35,7 @@ from PySide6.QtGui import QAction, QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QLineEdit, QMessageBox, QFrame,
-    QCheckBox, QGroupBox, QComboBox, QToolButton, QStyle, QSizePolicy
+    QCheckBox, QGroupBox, QComboBox, QListWidget, QListWidgetItem, QProgressDialog
 )
 
 # ---------------- App identity & paths ----------------
@@ -60,24 +71,178 @@ PKEXEC = shutil.which("pkexec")
 UDISKSCTL = shutil.which("udisksctl")
 LOSETUP = shutil.which("losetup")
 
-# License (auto-chosen for this code)
-LICENSE_NAME = "MIT License"
-LICENSE_URL = "https://opensource.org/license/mit/"
-PY_SIDE_LICENSE_URL = "https://doc.qt.io/qtforpython/licenses.html"
-UDISKS_LICENSE_URL = "https://gitlab.freedesktop.org/udisks/udisks/-/blob/master/COPYING"
-POLKIT_LICENSE_URL = "https://gitlab.freedesktop.org/polkit/polkit/-/blob/master/COPYING"
+# ---------------- Import translations ----------------
+from translations import TRANSLATIONS, LICENSE_URL
+
+# ---------------- Modern UI Stylesheet ----------------
+MODERN_STYLESHEET = """
+/* Global font and base styling */
+QWidget {
+    font-family: 'Segoe UI', 'SF Pro Display', 'Helvetica Neue', sans-serif;
+    font-size: 13px;
+    background-color: #1a202c;
+    color: #e9ecef;
+}
+
+/* Modern button base style */
+QPushButton {
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-weight: 600;
+    min-height: 32px;
+}
+
+QPushButton:hover {
+    opacity: 0.9;
+}
+
+QPushButton:pressed {
+    padding-top: 9px;
+    padding-bottom: 7px;
+}
+
+QPushButton:disabled {
+    opacity: 0.6;
+}
+
+/* Input fields */
+QLineEdit {
+    border: 2px solid #3d4450;
+    border-radius: 6px;
+    padding: 8px 12px;
+    background-color: #2b3038;
+    color: #e9ecef;
+    selection-background-color: #007bff;
+}
+
+QLineEdit:focus {
+    border-color: #007bff;
+}
+
+QLineEdit:disabled {
+    background-color: #1e2228;
+    color: #6c757d;
+}
+
+/* ComboBox */
+QComboBox {
+    border: 2px solid #3d4450;
+    border-radius: 6px;
+    padding: 6px 12px;
+    background-color: #2b3038;
+    color: #e9ecef;
+    min-width: 100px;
+}
+
+QComboBox:hover {
+    border-color: #007bff;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #2b3038;
+    border: 1px solid #3d4450;
+    selection-background-color: #007bff;
+    color: #e9ecef;
+}
+
+/* GroupBox */
+QGroupBox {
+    border: 1px solid #3d4450;
+    border-radius: 8px;
+    margin-top: 12px;
+    padding: 12px;
+    padding-top: 20px;
+    background-color: #252930;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    top: 4px;
+    padding: 2px 8px;
+    color: #adb5bd;
+    font-weight: 600;
+    font-size: 12px;
+    background-color: #252930;
+    border-radius: 4px;
+}
+
+/* CheckBox */
+QCheckBox {
+    color: #e9ecef;
+    spacing: 8px;
+    background: transparent;
+}
+
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 2px solid #3d4450;
+    background-color: #2b3038;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #007bff;
+    border-color: #007bff;
+}
+
+QCheckBox::indicator:hover {
+    border-color: #007bff;
+}
+
+/* Labels */
+QLabel {
+    color: #e9ecef;
+    background: transparent;
+}
+
+/* Status bar label */
+QLabel#status {
+    color: #adb5bd;
+    padding: 4px 8px;
+    font-size: 12px;
+    background: transparent;
+}
+"""
+
+# Button color styles (to be applied individually)
+BTN_STYLES = {
+    'danger': "QPushButton { background-color: #dc3545; color: white; } QPushButton:hover { background-color: #c82333; }",
+    'success': "QPushButton { background-color: #28a745; color: white; } QPushButton:hover { background-color: #218838; }",
+    'info': "QPushButton { background-color: #17a2b8; color: white; } QPushButton:hover { background-color: #138496; }",
+    'warning': "QPushButton { background-color: #fd7e14; color: white; } QPushButton:hover { background-color: #e96b02; }",
+    'secondary': "QPushButton { background-color: #4a5568; color: white; } QPushButton:hover { background-color: #3d4450; }",
+    'primary': "QPushButton { background-color: #007bff; color: white; } QPushButton:hover { background-color: #0069d9; }",
+    'purple': "QPushButton { background-color: #6f42c1; color: white; } QPushButton:hover { background-color: #5e37a6; }",
+}
 
 # ---------------- Utilities ----------------
-def run(cmd, capture=True):
+# Note: Group membership is NOT required when using polkit rules.
+# The polkit rule grants udisks2 permissions directly to the user.
+
+def run(cmd, capture=True, timeout=30):
     """Run command, return (rc, stdout, stderr)."""
     try:
         if capture:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                             text=True, check=False, timeout=timeout, encoding='utf-8', errors='replace')
             return p.returncode, p.stdout.strip(), p.stderr.strip()
         else:
-            p = subprocess.run(cmd)
+            p = subprocess.run(cmd, timeout=timeout, encoding='utf-8', errors='replace')
             return p.returncode, "", ""
-    except Exception as e:
+    except subprocess.TimeoutExpired:
+        return 124, "", "Command timed out"
+    except UnicodeError as e:
+        return 1, "", f"Encoding error: {e}"
+    except (OSError, subprocess.SubprocessError) as e:
         return 1, "", str(e)
 
 def open_url(url: str):
@@ -86,16 +251,64 @@ def open_url(url: str):
     except Exception:
         pass
 
+def open_file_manager(path: str):
+    """Open path in the default file manager."""
+    try:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+    except Exception:
+        # Fallback to xdg-open
+        xdg = shutil.which("xdg-open")
+        if xdg:
+            subprocess.Popen([xdg, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def calculate_checksum(filepath: str, algorithm: str = "sha256", callback=None) -> str:
+    """Calculate checksum of a file. callback(progress_percent) for progress updates."""
+    hash_func = hashlib.new(algorithm)
+    file_size = os.path.getsize(filepath)
+    bytes_read = 0
+
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192 * 16), b""):
+            hash_func.update(chunk)
+            bytes_read += len(chunk)
+            if callback and file_size > 0:
+                callback(int(bytes_read * 100 / file_size))
+
+    return hash_func.hexdigest()
+
+def get_recent_files() -> list:
+    """Get list of recently mounted ISO files."""
+    conf = read_conf()
+    return conf.get("recent_files", [])
+
+def add_to_recent_files(filepath: str, max_items: int = 10):
+    """Add a file to recent files list."""
+    conf = read_conf()
+    recent = conf.get("recent_files", [])
+
+    # Remove if already exists
+    if filepath in recent:
+        recent.remove(filepath)
+
+    # Add to front
+    recent.insert(0, filepath)
+
+    # Keep only max_items
+    recent = recent[:max_items]
+
+    conf["recent_files"] = recent
+    write_conf(conf)
+
 # ---- Mount state helpers ----
 def is_path_mounted(path: str) -> bool:
     """Quick /proc/mounts check."""
     try:
-        with open("/proc/mounts","r") as f:
+        with open("/proc/mounts", "r", encoding='utf-8', errors='replace') as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 2 and parts[1] == path:
                     return True
-    except Exception:
+    except (FileNotFoundError, PermissionError, UnicodeError):
         pass
     return False
 
@@ -105,9 +318,15 @@ def list_child_partitions(loop_dev: str):
     parts = []
     if rc == 0 and out.strip():
         for line in out.splitlines():
-            t, path = line.strip().split()
-            if t == "part":
-                parts.append(path)
+            line = line.strip()
+            if not line:
+                continue
+            # Split on whitespace, but handle cases where there might be extra spaces
+            parts_line = line.split()
+            if len(parts_line) >= 2:
+                t, path = parts_line[0], parts_line[1]
+                if t == "part" and path.startswith("/dev/"):
+                    parts.append(path)
     return parts
 
 def pick_mountable_block(base_loop_dev: str) -> str:
@@ -129,249 +348,54 @@ def pick_mountable_block(base_loop_dev: str) -> str:
                         return path
             if candidates:
                 return candidates[0][1]
-    except Exception:
+    except (OSError, ValueError, IndexError):
         pass
     return base_loop_dev
 
-# ---------------- i18n (English default) ----------------
-TR = {
-    "en": {
-        "browse": "Browse…",
-        "drop_hint": "Drop .iso here or click “Browse…”",
-        "mount": "Mount",
-        "unmount": "Unmount",
-        "options": "Options",
-        "autostart": "Autostart on login",
-        "install": "Install",
-        "uninstall": "Uninstall",
-        "ready": "Ready.",
-        "selected_iso": "Selected ISO: {path}",
-        "installed": "Installed.",
-        "uninstalled": "Uninstalled.",
-        "confirm_uninstall": "Are you sure you want to uninstall?",
-        "no_iso": "No ISO selected.",
-        "bad_path": "Path invalid or file does not exist.",
-        "already_mounted": "Something is already mounted. Unmount first.",
-        "loop_setup_fail": "loop-setup failed: {msg}",
-        "no_loop_device": "Loop device not found in output: {out}",
-        "mount_fail": "Mount failed: {msg}",
-        "unmount_fail": "Unmount failed: {msg}",
-        "loop_delete_fail": "Loop delete failed: {msg}",
-        "losetup_fail": "losetup failed (need sudo?): {msg}",
-        "losetup_delete_fail": "losetup -d failed: {msg}",
-        "mounted_to": "Mounted {name} -> {mp}",
-        "unmount_ok": "Unmount OK.",
-        "tray_running": "Running in background (system tray).",
-        "show": "Show",
-        "exit": "Exit",
-        "preferences": "Preferences",
-        "language": "Language",
-        "theme": "Theme",
-        "file_filter": "ISO Files (*.iso)",
-        "pick_iso_title": "Pick ISO",
-        "ready_to_mount": "Ready to mount.",
-        "not_ready": "Not ready: Fix permissions first.",
-        "restored_mount": "Restored previous mount: {mp}",
-        "fixperms": "Fix permissions",
-        "fixperms_hint": "Installs a PolicyKit rule for your user so NMount can set up loop devices and mount ISOs without repeated passwords.",
-        "fixperms_ok": "Permissions fixed (polkit rule installed).",
-        "fixperms_exists": "Permissions already configured.",
-        "fixperms_need_pkexec": "pkexec not found; run as root:\n{cmd}",
-        "fixperms_failed": "Failed to install polkit rule: {err}",
-        "help": "Help",
-        "license": "License",
-        "why": "Why?",
-        "why_fix_title": "Why 'Fix permissions'?",
-        "why_fix_text": (
-            "NMount uses 'udisksctl' (udisks2) to set up loop devices and mount ISO files.\n"
-            "By default, these actions may require authentication (root). The 'Fix permissions' button installs a "
-            "small PolicyKit rule that grants your current user permission to perform only these specific udisks "
-            "actions while you are logged in locally. This avoids repeated password prompts.\n\n"
-            "• Location: /etc/polkit-1/rules.d/90-nmount.rules\n"
-            "• Scope: current user only; local active session\n"
-            "• Actions: org.freedesktop.udisks2.loop-setup, filesystem-mount*, unmount-others\n\n"
-            "Uninstall removes this rule. You can also remove it manually with:\n"
-            "  sudo rm /etc/polkit-1/rules.d/90-nmount.rules"
-        ),
-        "help_title": "NMount – Help",
-        "help_text": (
-            "• Browse / Drop: choose an .iso file via dialog or drag-and-drop.\n"
-            "• Mount: creates a read-only loop device and mounts it via udisks.\n"
-            "• Unmount: unmounts and deletes the loop device.\n"
-            "• Autostart on login: create/remove an autostart entry under ~/.config/autostart.\n"
-            "• Install / Uninstall: install to ~/.local/bin and application menu, also place a Desktop shortcut. "
-            "Uninstall cleans up created files and will close the app.\n"
-            "• Fix permissions: installs a PolicyKit rule so udisks operations don't prompt for a password.\n"
-            "• Language / Theme: instant UI updates, including tray menu."
-        ),
-        "license_title": "License",
-        "license_text": (
-            f"NMount source code is released under the {LICENSE_NAME}.\n"
-            f"License: {LICENSE_URL}\n\n"
-            "Third-party tools/licenses:\n"
-            f"• PySide6 / Qt: {PY_SIDE_LICENSE_URL}\n"
-            f"• udisks2: {UDISKS_LICENSE_URL}\n"
-            f"• polkit: {POLKIT_LICENSE_URL}\n"
-        ),
-        "uninstall_quit_title": "Uninstalling",
-        "uninstall_quit_text": "The app will exit now because you removed it.",
-    },
-    "hr": {
-        "browse": "Odaberi…",
-        "drop_hint": "Dovuci .iso ovdje ili klikni „Odaberi…“",
-        "mount": "Mount",
-        "unmount": "Unmount",
-        "options": "Opcije",
-        "autostart": "Autostart pri prijavi",
-        "install": "Instaliraj",
-        "uninstall": "Deinstaliraj",
-        "ready": "Spremno.",
-        "selected_iso": "Izabran ISO: {path}",
-        "installed": "Instalirano.",
-        "uninstalled": "Deinstalirano.",
-        "confirm_uninstall": "Sigurno želiš deinstalirati?",
-        "no_iso": "Nisi izabrao ISO.",
-        "bad_path": "Putanja ne valja ili fajl ne postoji.",
-        "already_mounted": "Već je nešto montirano. Prvo Unmount.",
-        "loop_setup_fail": "loop-setup greška: {msg}",
-        "no_loop_device": "Nisam našao loop device u outputu: {out}",
-        "mount_fail": "Mount greška: {msg}",
-        "unmount_fail": "Unmount greška: {msg}",
-        "loop_delete_fail": "Loop delete greška: {msg}",
-        "losetup_fail": "losetup greška (treba sudo?): {msg}",
-        "losetup_delete_fail": "losetup -d greška: {msg}",
-        "mounted_to": "Mounted {name} -> {mp}",
-        "unmount_ok": "Unmount OK.",
-        "tray_running": "Radi u pozadini (system tray).",
-        "show": "Prikaži",
-        "exit": "Izlaz",
-        "preferences": "Postavke",
-        "language": "Jezik",
-        "theme": "Tema",
-        "file_filter": "ISO datoteke (*.iso)",
-        "pick_iso_title": "Odaberi ISO",
-        "ready_to_mount": "Spremno za mount.",
-        "not_ready": "Nije spremno: prvo Sredi dozvole.",
-        "restored_mount": "Vraćen prijašnji mount: {mp}",
-        "fixperms": "Sredi dozvole",
-        "fixperms_hint": "Instalira PolicyKit pravilo za tvog korisnika kako bi NMount mogao podešavati loop uređaje i montirati ISO bez ponovnog traženja lozinke.",
-        "fixperms_ok": "Dozvole sređene (polkit pravilo instalirano).",
-        "fixperms_exists": "Dozvole su već podešene.",
-        "fixperms_need_pkexec": "Nema pkexec; pokreni kao root:\n{cmd}",
-        "fixperms_failed": "Greška pri instalaciji polkit pravila: {err}",
-        "help": "Pomoć",
-        "license": "Licenca",
-        "why": "Zašto?",
-        "why_fix_title": "Zašto 'Sredi dozvole'?",
-        "why_fix_text": (
-            "NMount koristi 'udisksctl' (udisks2) za loop uređaje i montiranje ISO-a.\n"
-            "Standardno za te akcije treba autentikacija (root). 'Sredi dozvole' instalira "
-            "malo PolicyKit pravilo koje tvom korisniku dopušta baš te udisks akcije dok si lokalno prijavljen. "
-            "Tako nema stalnog traženja lozinke.\n\n"
-            "• Lokacija: /etc/polkit-1/rules.d/90-nmount.rules\n"
-            "• Opseg: samo trenutni korisnik; lokalna aktivna sesija\n"
-            "• Akcije: org.freedesktop.udisks2.loop-setup, filesystem-mount*, unmount-others\n\n"
-            "Deinstalacija briše ovo pravilo. Možeš ga obrisati i ručno:\n"
-            "  sudo rm /etc/polkit-1/rules.d/90-nmount.rules"
-        ),
-        "help_title": "NMount – Pomoć",
-        "help_text": (
-            "• Odaberi / DnD: izaberi .iso preko dijaloga ili povuci u prozor.\n"
-            "• Mount: napravi read-only loop uređaj i montira ga preko udisksa.\n"
-            "• Unmount: odmontira i obriše loop uređaj.\n"
-            "• Autostart pri prijavi: doda/ukloni autostart u ~/.config/autostart.\n"
-            "• Instaliraj / Deinstaliraj: instalira u ~/.local/bin i u izbornik aplikacija, te stavi prečac na Desktop. "
-            "Deinstalacija počisti i zatvara aplikaciju.\n"
-            "• Sredi dozvole: instalira PolicyKit pravilo da udisks ne traži lozinku.\n"
-            "• Jezik / Tema: promjena odmah vrijedi, uključujući tray meni."
-        ),
-        "license_title": "Licenca",
-        "license_text": (
-            f"NMount izvorni kod je objavljen pod {LICENSE_NAME}.\n"
-            f"Licenca: {LICENSE_URL}\n\n"
-            "Vanjske komponente/licence:\n"
-            f"• PySide6 / Qt: {PY_SIDE_LICENSE_URL}\n"
-            f"• udisks2: {UDISKS_LICENSE_URL}\n"
-            f"• polkit: {POLKIT_LICENSE_URL}\n"
-        ),
-        "uninstall_quit_title": "Deinstalacija",
-        "uninstall_quit_text": "Aplikacija će se sada ugasiti jer ste je uklonili.",
-    },
-}
+# (duplicate imports removed - already imported at lines 65-66)
 
-# ---------------- Theme CSS ----------------
-THEMES = {
-    "Indigo Night": """
-        QWidget { background: #111827; color: #e5e7eb; }
-        QGroupBox { border: 1px solid #374151; border-radius: 12px; margin-top: 12px; }
-        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; color:#93c5fd; }
-        QPushButton { border: 1px solid #4c1d95; border-radius: 10px; padding: 6px 12px; background:#1f2937; }
-        QPushButton:hover { background:#312e81; }
-        QPushButton:disabled { color:#9ca3af; border-color:#374151; }
-        QLineEdit { border:1px solid #374151; border-radius:10px; padding:6px 8px; background:#0b1220; }
-        QCheckBox, QLabel, QComboBox { background: transparent; }
-        QComboBox, QMenu { border:1px solid #374151; border-radius:10px; background:#0b1220; }
-        QFrame#drop { border:2px dashed #64748b; border-radius:12px; }
-    """,
-    "Neon Black": """
-        QWidget { background: #000000; color: #e0e0e0; }
-        QGroupBox { border:1px solid #222; border-radius:12px; margin-top:12px; }
-        QGroupBox::title { left:10px; padding:0 6px; color:#39ff14; }
-        QPushButton { border:1px solid #00ffff; border-radius:10px; padding:6px 12px; background:#111; }
-        QPushButton:hover { background:#0a0f14; }
-        QLineEdit, QComboBox, QMenu { border:1px solid #00ffff; border-radius:10px; background:#0a0a0a; }
-        QFrame#drop { border:2px dashed #39ff14; border-radius:12px; }
-    """,
-    "Nord": """
-        QWidget { background:#2e3440; color:#e5e9f0; }
-        QGroupBox { border:1px solid #4c566a; border-radius:12px; margin-top:12px; }
-        QGroupBox::title { left:10px; padding:0 6px; color:#88c0d0; }
-        QPushButton { border:1px solid #5e81ac; border-radius:10px; padding:6px 12px; background:#3b4252; }
-        QPushButton:hover { background:#434c5e; }
-        QLineEdit, QComboBox, QMenu { border:1px solid #4c566a; border-radius:10px; background:#3b4252; }
-        QFrame#drop { border:2px dashed #81a1c1; border-radius:12px; }
-    """,
-    "Solarized": """
-        QWidget { background:#002b36; color:#eee8d5; }
-        QGroupBox { border:1px solid #073642; border-radius:12px; margin-top:12px; }
-        QGroupBox::title { left:10px; padding:0 6px; color:#b58900; }
-        QPushButton { border:1px solid #268bd2; border-radius:10px; padding:6px 12px; background:#073642; }
-        QPushButton:hover { background:#0b3a44; }
-        QLineEdit, QComboBox, QMenu { border:1px solid #586e75; border-radius:10px; background:#073642; }
-        QFrame#drop { border:2px dashed #93a1a1; border-radius:12px; }
-    """,
-    "Light Minimal": """
-        QWidget { background:#ffffff; color:#111827; }
-        QGroupBox { border:1px solid #e5e7eb; border-radius:12px; margin-top:12px; }
-        QGroupBox::title { left:10px; padding:0 6px; color:#6b7280; }
-        QPushButton { border:1px solid #d1d5db; border-radius:10px; padding:6px 12px; background:#f9fafb; }
-        QPushButton:hover { background:#f3f4f6; }
-        QLineEdit, QComboBox, QMenu { border:1px solid #d1d5db; border-radius:10px; background:#ffffff; }
-        QFrame#drop { border:2px dashed #9ca3af; border-radius:12px; }
-    """,
-    "Purple Waves": """
-        QWidget { background:#1a1027; color:#f3e8ff; }
-        QGroupBox { border:1px solid #5b21b6; border-radius:12px; margin-top:12px; }
-        QGroupBox::title { left:10px; padding:0 6px; color:#c084fc; }
-        QPushButton { border:1px solid #7c3aed; border-radius:10px; padding:6px 12px; background:#2b1644; }
-        QPushButton:hover { background:#3b1c5a; }
-        QLineEdit, QComboBox, QMenu { border:1px solid #7c3aed; border-radius:10px; background:#2b1644; }
-        QFrame#drop { border:2px dashed #c4b5fd; border-radius:12px; }
-    """,
-}
+
 
 # ---------------- Config helpers ----------------
 def read_conf():
+    """Read configuration with backup recovery."""
     if CONF_FILE.exists():
         try:
-            return json.loads(CONF_FILE.read_text())
-        except Exception:
-            pass
+            return json.loads(CONF_FILE.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, UnicodeError):
+            # Try to read backup
+            backup_file = CONF_FILE.with_suffix('.json.bak')
+            if backup_file.exists():
+                try:
+                    return json.loads(backup_file.read_text(encoding='utf-8'))
+                except (json.JSONDecodeError, OSError, UnicodeError):
+                    pass
+            # If both fail, return default config
+            return {}
     return {}
 
 def write_conf(data: dict):
+    """Write configuration atomically with backup."""
     CONF_DIR.mkdir(parents=True, exist_ok=True)
-    CONF_FILE.write_text(json.dumps(data, indent=2))
+    
+    # Create backup if main config exists
+    if CONF_FILE.exists():
+        backup_file = CONF_FILE.with_suffix('.json.bak')
+        try:
+            shutil.copy2(CONF_FILE, backup_file)
+        except (OSError, shutil.Error):
+            pass  # Backup failure is not critical
+    
+    # Write to temporary file first, then atomic move
+    temp_file = CONF_FILE.with_suffix('.json.tmp')
+    try:
+        temp_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+        temp_file.replace(CONF_FILE)  # Atomic operation
+    except Exception as e:
+        # Clean up temp file if something went wrong
+        if temp_file.exists():
+            temp_file.unlink()
+        raise e
 
 def get_mount_base_from_conf_or_default(cli_mount_base: Path | None):
     if cli_mount_base:
@@ -411,7 +435,7 @@ X-GNOME-Autostart-enabled=true
         try:
             if AUTOSTART_FILE.exists():
                 AUTOSTART_FILE.unlink()
-        except Exception:
+        except OSError:
             pass
         data["autostart"] = False
         files = [f for f in data.get("files", []) if f != str(AUTOSTART_FILE)]
@@ -432,7 +456,7 @@ def ensure_fallback_icon():
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         if not FALLBACK_ICON.exists():
             FALLBACK_ICON.write_text(SVG_ICON_CONTENT)
-    except Exception:
+    except OSError:
         pass
 
 def app_icon():
@@ -519,13 +543,22 @@ def install_self(mount_base: Path, keep_autostart: bool):
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     src = Path(__file__).resolve()
     dst = APP_BIN
-    shutil.copy2(src, dst)
-    dst.chmod(0o755)
+    
+    # Atomic copy using temporary file
+    temp_dst = dst.with_suffix('.tmp')
+    try:
+        shutil.copy2(src, temp_dst)
+        temp_dst.chmod(0o755)
+        temp_dst.replace(dst)  # Atomic operation
+    except Exception as e:
+        if temp_dst.exists():
+            temp_dst.unlink()
+        raise e
 
     app_launcher = write_desktop_file(APP_LAUNCHER, dst, make_executable=False)
     try:
         USER_DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception:
+    except OSError:
         pass
     desktop_shortcut = write_desktop_file(DESKTOP_SHORTCUT, dst, make_executable=True)
 
@@ -555,7 +588,7 @@ def uninstall_self():
     try:
         if AUTOSTART_FILE.exists():
             AUTOSTART_FILE.unlink()
-    except Exception:
+    except OSError:
         pass
 
     # 2) remove polkit rule we added (best-effort). Avoid stat on /etc to prevent PermissionError on some setups.
@@ -565,7 +598,7 @@ def uninstall_self():
         try:
             if POLKIT_RULE_DST.exists():
                 POLKIT_RULE_DST.unlink()
-        except Exception:
+        except (OSError, PermissionError):
             pass
 
     # 3) remove installed files
@@ -574,7 +607,7 @@ def uninstall_self():
             p = Path(f)
             if p.exists():
                 p.unlink()
-        except Exception:
+        except OSError:
             pass
 
     # 4) try clean empty dirs
@@ -582,7 +615,7 @@ def uninstall_self():
         try:
             if d.exists() and not any(d.iterdir()):
                 d.rmdir()
-        except Exception:
+        except OSError:
             pass
 
     # 5) reset config
@@ -604,7 +637,7 @@ def uninstall_self():
 def polkit_rule_present() -> bool:
     try:
         return POLKIT_RULE_DST.exists()
-    except Exception:
+    except (OSError, PermissionError):
         return False
 
 def polkit_rule_text_for_user(user: str) -> str:
@@ -628,20 +661,57 @@ polkit.addRule(function(action, subject) {{
 """
 
 def install_polkit_rule():
+    """Install polkit rule to allow udisks2 operations without password prompts."""
     if polkit_rule_present():
         return True, ""
+
+    # Clean up any existing broken rules first
+    cleanup_old_polkit_rules()
+
     user = getpass.getuser()
+    # Sanitize username to prevent command injection
+    # Valid Linux usernames: alphanumeric, underscore, hyphen
+    if not user or not all(c.isalnum() or c in '_-' for c in user):
+        return False, "Invalid username format"
+
+    # Create the polkit rule (no group membership needed - polkit handles permissions)
     rule = polkit_rule_text_for_user(user)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CACHE_DIR / "90-nmount.rules"
     tmp.write_text(rule)
+
     if not PKEXEC:
-        cmd = f"sudo install -m 0644 {tmp} {POLKIT_RULE_DST}"
-        return False, cmd
+        # Use proper command list instead of string formatting to prevent injection
+        return False, ["sudo", "install", "-m", "0644", str(tmp), str(POLKIT_RULE_DST)]
+
     rc, _, err = run([PKEXEC, "install", "-m", "0644", str(tmp), str(POLKIT_RULE_DST)])
     if rc != 0:
         return False, err or "pkexec install failed"
+
     return True, ""
+
+def cleanup_old_polkit_rules():
+    """Clean up any existing NMount polkit rules that might be broken."""
+    try:
+        # Only attempt cleanup if we can access the directory
+        if POLKIT_RULE_DST.parent.exists():
+            if POLKIT_RULE_DST.exists():
+                # Check if the rule contains our marker
+                content = POLKIT_RULE_DST.read_text(encoding='utf-8', errors='replace')
+                if POLKIT_RULE_MARK not in content:
+                    # Remove broken rule
+                    if PKEXEC:
+                        run([PKEXEC, "rm", "-f", str(POLKIT_RULE_DST)], capture=False)
+                    else:
+                        # Try direct removal, but ignore permission errors
+                        try:
+                            POLKIT_RULE_DST.unlink()
+                        except PermissionError:
+                            pass
+                    print("Cleaned up broken polkit rule")
+    except (OSError, PermissionError):
+        # Ignore cleanup errors
+        pass
 
 # ---------------- Drag & Drop frame ----------------
 class DropFrame(QFrame):
@@ -649,23 +719,54 @@ class DropFrame(QFrame):
     def __init__(self):
         super().__init__()
         self.setObjectName("drop")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("""
+            QFrame#drop {
+                border: 2px dashed #4a5568;
+                border-radius: 12px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2d3748, stop:1 #1a202c);
+                min-height: 80px;
+                max-height: 150px;
+            }
+            QFrame#drop:hover {
+                border-color: #4299e1;
+                border-style: solid;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2c3e50, stop:1 #1a202c);
+            }
+        """)
         self.setAcceptDrops(True)
         self.label = QLabel("", alignment=Qt.AlignmentFlag.AlignCenter)
-        self.label.setStyleSheet("padding: 16px;")
+        self.label.setStyleSheet("""
+            color: #a0aec0;
+            font-size: 14px;
+            font-weight: 500;
+            padding: 24px;
+            background: transparent;
+        """)
         layout = QVBoxLayout(self)
         layout.addWidget(self.label)
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             urls = e.mimeData().urls()
-            if urls and urls[0].toLocalFile().lower().endswith(".iso"):
-                e.acceptProposedAction()
+            if urls:
+                for url in urls:
+                    path = url.toLocalFile()
+                    if path and path.lower().endswith(".iso") and Path(path).is_file():
+                        e.acceptProposedAction()
+                        return
+        e.ignore()
+    
     def dropEvent(self, e):
-        urls = e.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            if path.lower().endswith(".iso"):
-                self.fileDropped.emit(path)
+        if e.mimeData().hasUrls():
+            urls = e.mimeData().urls()
+            if urls:
+                for url in urls:
+                    path = url.toLocalFile()
+                    if path and path.lower().endswith(".iso") and Path(path).is_file():
+                        self.fileDropped.emit(path)
+                        return  # Only handle first valid ISO
 
 # ---------------- Main window ----------------
 class MainWindow(QWidget):
@@ -678,31 +779,49 @@ class MainWindow(QWidget):
             sys.exit(2)
 
         conf0 = read_conf()
-        self.lang = conf0.get("language", "en")
-        self.theme = conf0.get("theme", "Light Minimal")
+        # Force English as default for new installations
+        # If no language is set or it's invalid, default to English
+        saved_lang = conf0.get("language", "en")
+        if saved_lang in ["en", "hr"]:
+            self.lang = saved_lang
+        else:
+            self.lang = "en"
+        self.theme = "System"  # Always use system styling
 
         self.setWindowTitle(APP_NAME)
-        self.setMinimumWidth(720)
+        self.setMinimumSize(800, 600)
+        self.resize(800, 600)
+
+        # Apply modern stylesheet
+        self.setStyleSheet(MODERN_STYLESHEET)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        # Mount tracking - support multiple mounted ISOs
+        self.mounted_isos = []  # List of dicts: {iso_path, loop_device, mount_device, mount_point}
+        self.mount_base = mount_base
+
+        # Current single mount tracking (for backward compatibility)
         self.loop_device = None
         self.mount_device = None
         self.mount_point = None
-        self.mount_base = mount_base
+
+        # Settings
+        self.auto_unmount_on_exit = conf0.get("auto_unmount_on_exit", True)
 
         # internal readiness cache (to avoid race while polkit writes the file)
         self._perms_fixed = bool(conf0.get("polkit_rule")) or polkit_rule_present()
 
-        # ====== TOP PERMISSION BAR (FULL WIDTH) ======
+        # ====== PERMISSIONS SECTION ======
         self.btn_fixperms = QPushButton()
         self.btn_fixperms.clicked.connect(self.on_fix_permissions)
-        self.btn_fixperms.setEnabled(not self._perms_fixed)
-        self.btn_fixperms.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.lbl_fix_hint = QLabel()
-        self.lbl_fix_hint.setWordWrap(False)
-        self.lbl_fix_hint.setStyleSheet("color: #9ca3af; padding-left: 8px;")
-        self.btn_why = QToolButton()
-        self.btn_why.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxQuestion))
-        self.btn_why.setAutoRaise(True)
+        self.btn_fixperms.setStyleSheet(BTN_STYLES['danger'])
+        self.btn_fixperms.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.btn_why = QPushButton()
         self.btn_why.clicked.connect(self.show_why_fix)
+        self.btn_why.setStyleSheet(BTN_STYLES['info'])
+        self.btn_why.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_why.setFixedWidth(100)
 
         # blinking setup
         self._blink_on = False
@@ -710,45 +829,95 @@ class MainWindow(QWidget):
         self.blink_timer = QTimer(self)
         self.blink_timer.setInterval(600)
         self.blink_timer.timeout.connect(self._tick_blink)
-        self._update_blinking()
 
-        perm_bar = QVBoxLayout()
-        perm_row_btn = QHBoxLayout()
-        perm_row_btn.addWidget(self.btn_fixperms, 1)
-        perm_bar.addLayout(perm_row_btn)
-        perm_row_hint = QHBoxLayout()
-        perm_row_hint.addStretch(1)
-        perm_row_hint.addWidget(self.lbl_fix_hint, 0)
-        perm_row_hint.addWidget(self.btn_why, 0)
-        perm_bar.addLayout(perm_row_hint)
-
+        # Fix permissions button with why button on the right
+        perm_layout = QHBoxLayout()
+        perm_layout.addWidget(self.btn_fixperms, 1)  # Fix permissions takes most space (like path field)
+        perm_layout.addSpacing(1)  # Spacing between buttons
+        perm_layout.addWidget(self.btn_why)  # Why button on the right
+        
         # ====== MAIN CONTROLS (disabled until permissions fixed) ======
+        # ISO path field with browse button on the right
         self.path_edit = QLineEdit()
         self.btn_browse = QPushButton()
         self.btn_browse.clicked.connect(self.browse_iso)
+        self.btn_browse.setText("Browse")
+        self.btn_browse.setStyleSheet(BTN_STYLES['secondary'])
+        self.btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_browse.setFixedWidth(100)
 
-        top = QHBoxLayout()
-        top.addWidget(self.path_edit)
-        top.addWidget(self.btn_browse)
+        # Horizontal layout for path field and browse button
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(self.path_edit, 1)  # Path field takes most space
+        path_layout.addWidget(self.btn_browse)     # Browse button on the right
 
+        # Recent files dropdown
+        self.dd_recent = QComboBox()
+        self.dd_recent.addItem("-- Recent Files --")
+        self._populate_recent_files()
+        self.dd_recent.currentIndexChanged.connect(self.on_recent_selected)
+
+        # Drop zone below the path field
         self.drop = DropFrame()
         self.drop.fileDropped.connect(self.set_iso_path)
 
+        # Action buttons row
         self.btn_mount = QPushButton()
         self.btn_unmount = QPushButton()
-        self.btn_unmount.setEnabled(False)
+        self.btn_open_fm = QPushButton()
+        self.btn_checksum = QPushButton()
+
         self.btn_mount.clicked.connect(self.do_mount)
         self.btn_unmount.clicked.connect(self.do_unmount)
+        self.btn_open_fm.clicked.connect(self.open_in_file_manager)
+        self.btn_checksum.clicked.connect(self.show_checksum)
+
+        self.btn_unmount.setEnabled(False)
+        self.btn_open_fm.setEnabled(False)
+
+        self.btn_mount.setStyleSheet(BTN_STYLES['success'])
+        self.btn_unmount.setStyleSheet(BTN_STYLES['warning'])
+        self.btn_open_fm.setStyleSheet(BTN_STYLES['primary'])
+        self.btn_checksum.setStyleSheet(BTN_STYLES['info'])
+
+        for btn in [self.btn_mount, self.btn_unmount, self.btn_open_fm, self.btn_checksum]:
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         row_btns = QHBoxLayout()
+        row_btns.addWidget(self.btn_checksum)
         row_btns.addStretch(1)
         row_btns.addWidget(self.btn_mount)
+        row_btns.addWidget(self.btn_open_fm)
         row_btns.addWidget(self.btn_unmount)
 
-        # Options (autostart + help + license + install/uninstall in same row)
+        # Mounted ISOs list
+        self.lbl_mounted = QLabel()
+        self.mounted_list = QListWidget()
+        self.mounted_list.setMinimumHeight(60)
+        self.mounted_list.setMaximumHeight(100)
+        self.mounted_list.setStyleSheet("""
+            QListWidget {
+                background-color: #2b3038;
+                border: 1px solid #3d4450;
+                border-radius: 6px;
+                color: #e9ecef;
+            }
+            QListWidget::item {
+                padding: 4px 8px;
+            }
+            QListWidget::item:selected {
+                background-color: #007bff;
+            }
+        """)
+        self.mounted_list.itemClicked.connect(self.on_mounted_item_selected)
+
+        # Options (simplified layout)
         self.box_opts = QGroupBox()
         self.cb_autostart = QCheckBox()
         self.cb_autostart.setChecked(bool(conf0.get("autostart", False)))
+        self.cb_auto_unmount = QCheckBox()
+        self.cb_auto_unmount.setChecked(self.auto_unmount_on_exit)
+        self.cb_auto_unmount.stateChanged.connect(self.on_auto_unmount_changed)
 
         self.btn_help = QPushButton()
         self.btn_help.clicked.connect(self.show_help)
@@ -758,73 +927,107 @@ class MainWindow(QWidget):
         self.btn_install_toggle = QPushButton()
         self.btn_install_toggle.clicked.connect(self.toggle_install)
         self.update_install_btn_text()
+        self.btn_help.setStyleSheet(BTN_STYLES['info'])
+        self.btn_license.setStyleSheet(BTN_STYLES['info'])
+        self.btn_install_toggle.setStyleSheet(BTN_STYLES['purple'])
+        self.btn_help.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_license.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_install_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        row_opts_top = QHBoxLayout()
-        row_opts_top.addWidget(self.cb_autostart)
-        row_opts_top.addStretch(1)
+        # Clean vertical layout
+        opts_layout = QVBoxLayout()
+        opts_layout.addWidget(self.cb_autostart)
+        opts_layout.addWidget(self.cb_auto_unmount)
+        opts_layout.addSpacing(10)
+        
+        # Button row
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_help)
+        btn_row.addWidget(self.btn_license)
+        btn_row.addWidget(self.btn_install_toggle)
+        btn_row.addStretch()
+        
+        opts_layout.addLayout(btn_row)
+        self.box_opts.setLayout(opts_layout)
 
-        row_opts_bottom = QHBoxLayout()
-        row_opts_bottom.addWidget(self.btn_help)
-        row_opts_bottom.addWidget(self.btn_license)
-        row_opts_bottom.addWidget(self.btn_install_toggle)  # aligned with Help/License
-        row_opts_bottom.addStretch(1)
-
-        vbox_opts = QVBoxLayout()
-        vbox_opts.addLayout(row_opts_top)
-        vbox_opts.addLayout(row_opts_bottom)
-        self.box_opts.setLayout(vbox_opts)
-
-        # Preferences: language + theme
+        # Preferences: language only (system styling only)
         self.box_prefs = QGroupBox()
         self.lbl_lang = QLabel()
-        self.lbl_theme = QLabel()
         self.dd_lang = QComboBox()
         self.dd_lang.addItems(["English", "Hrvatski"])
         self.lang_index = {"en": 0, "hr": 1}
         self.dd_lang.setCurrentIndex(self.lang_index.get(self.lang, 0))
-        self.dd_theme = QComboBox()
-        self.dd_theme.addItems(list(THEMES.keys()))
-        if self.theme in THEMES:
-            self.dd_theme.setCurrentText(self.theme)
 
-        row_prefs = QHBoxLayout()
-        row_prefs.addWidget(self.lbl_lang)
-        row_prefs.addWidget(self.dd_lang)
-        row_prefs.addSpacing(20)
-        row_prefs.addWidget(self.lbl_theme)
-        row_prefs.addWidget(self.dd_theme)
-        self.box_prefs.setLayout(row_prefs)
+        # Simple centered layout
+        prefs_layout = QHBoxLayout()
+        prefs_layout.addStretch(1)
+        prefs_layout.addWidget(self.lbl_lang)
+        prefs_layout.addWidget(self.dd_lang)
+        prefs_layout.addStretch(1)
+        self.box_prefs.setLayout(prefs_layout)
 
         # Status
         self.status = QLabel()
-        self.status.setStyleSheet("")
+        self.status.setObjectName("status")
 
-        # Main layout
-        layout = QVBoxLayout(self)
-        layout.addLayout(perm_bar)
-        layout.addLayout(top)
-        layout.addWidget(self.drop)
-        layout.addLayout(row_btns)
-        layout.addWidget(self.box_opts)
-        layout.addWidget(self.box_prefs)
-        layout.addWidget(self.status)
+        # Main vertical layout with proper spacing
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 16, 20, 16)
+        main_layout.setSpacing(10)
+
+        # Top section - permissions
+        perm_layout.setSpacing(8)
+        main_layout.addLayout(perm_layout)
+
+        # ISO path section - path field with browse button
+        path_layout.setSpacing(8)
+        main_layout.addLayout(path_layout)
+
+        # Recent files dropdown
+        main_layout.addWidget(self.dd_recent)
+
+        # Drop zone section - takes available space
+        main_layout.addWidget(self.drop, 1)
+
+        # Mounted ISOs list
+        main_layout.addWidget(self.lbl_mounted)
+        main_layout.addWidget(self.mounted_list)
+
+        # Bottom section - buttons row (fixed height)
+        row_btns.setSpacing(8)
+        main_layout.addLayout(row_btns)
+
+        # Options and preferences in horizontal row
+        options_row = QHBoxLayout()
+        options_row.setSpacing(12)
+        options_row.addWidget(self.box_opts, 1)
+        options_row.addWidget(self.box_prefs, 1)
+        main_layout.addLayout(options_row)
+
+        # Status at bottom
+        main_layout.addWidget(self.status)
 
         # Tray
         self.tray = self.build_tray()
         self.setWindowIcon(app_icon())
 
         # Keep tray alive even if window closed
-        QApplication.instance().setQuitOnLastWindowClosed(False)
+        # System will handle tray behavior automatically
 
         # Connectors
         self.cb_autostart.stateChanged.connect(self.on_autostart_changed)
         self.dd_lang.currentIndexChanged.connect(self.on_language_changed)
-        self.dd_theme.currentIndexChanged.connect(self.on_theme_changed)
 
         # Init texts & theme and try to restore last mount
         self.apply_language()
         self.apply_theme()
         self.restore_previous_mount()
+
+        # Initialize mounted list visibility (hidden when empty)
+        self._update_mounted_list()
+
+        # Update button state after everything is created
+        self._update_permissions_button()
 
         # Lock UI until perms fixed
         self.set_main_enabled(self.has_permission_rules())
@@ -838,32 +1041,59 @@ class MainWindow(QWidget):
 
     # ---------- Blink logic ----------
     def _tick_blink(self):
-        self._blink_on = not self._blink_on
-        if self._blink_on:
-            self.btn_fixperms.setStyleSheet(
-                "QPushButton { border:2px solid #ef4444; background:#3b1c1c; }"
-            )
-        else:
-            self.btn_fixperms.setStyleSheet(self._orig_fix_style)
+        # Only blink if permissions are NOT fixed
+        if not self.has_permission_rules():
+            self._blink_on = not self._blink_on
+            if self._blink_on:
+                # Blink state - lighter red with glow effect
+                self.btn_fixperms.setStyleSheet(
+                    "QPushButton { background-color: #e74c3c; color: white; border: 2px solid #ff6b6b; }"
+                    "QPushButton:hover { background-color: #c0392b; }"
+                )
+            else:
+                # Normal state - restore original red style
+                self.btn_fixperms.setStyleSheet(BTN_STYLES['danger'])
 
-    def _update_blinking(self):
-        if self.has_permission_rules():
+    def _update_permissions_button(self):
+        """Update permissions button text, color, and state based on current permissions."""
+        has_perms = self.has_permission_rules()
+
+        if has_perms:
+            # Permissions are fixed - green button, disabled
+            self.btn_fixperms.setText(self.t("fixperms_fixed"))
+            self.btn_fixperms.setStyleSheet(BTN_STYLES['success'])
+            self.btn_fixperms.setEnabled(False)
+            self.btn_fixperms.setCursor(Qt.CursorShape.ArrowCursor)
             self.blink_timer.stop()
-            self.btn_fixperms.setStyleSheet(self._orig_fix_style)
         else:
+            # Permissions not fixed - red button, enabled, blinking
+            self.btn_fixperms.setText(self.t("fixperms"))
+            self.btn_fixperms.setStyleSheet(BTN_STYLES['danger'])
+            self.btn_fixperms.setEnabled(True)
+            self.btn_fixperms.setCursor(Qt.CursorShape.PointingHandCursor)
             if not self.blink_timer.isActive():
                 self._blink_on = False
                 self.blink_timer.start()
+        
+        # Update main interface based on permissions
+        self.set_main_enabled(has_perms)
+
+    def _update_blinking(self):
+        self._update_permissions_button()
 
     # ---------- Language & Theme ----------
     def t(self, key, **kwargs):
-        msg = TR.get(self.lang, TR["en"]).get(key, key)
-        return msg.format(**kwargs) if kwargs else msg
+        translations = TRANSLATIONS.get(self.lang, TRANSLATIONS["en"])
+        msg = translations.get(key, key)
+        if msg is None:
+            msg = key
+        return msg.format(**kwargs) if kwargs else msg or ""
 
     def apply_language(self):
-        self.btn_fixperms.setText(self.t("fixperms"))
-        self.lbl_fix_hint.setText(self.t("fixperms_hint"))
+        self.btn_why.setText(self.t("why"))
         self.btn_why.setToolTip(self.t("why_fix_title"))
+        # Update permissions button with correct language
+        self._update_permissions_button()
 
         self.path_edit.setPlaceholderText(self.t("pick_iso_title"))
         self.btn_browse.setText(self.t("browse"))
@@ -875,11 +1105,14 @@ class MainWindow(QWidget):
         self.box_prefs.setTitle(self.t("preferences"))
 
         self.cb_autostart.setText(self.t("autostart"))
+        self.cb_auto_unmount.setText(self.t("auto_unmount"))
+        self.btn_open_fm.setText(self.t("open_fm"))
+        self.btn_checksum.setText(self.t("checksum"))
+        self.lbl_mounted.setText(self.t("mounted_isos"))
         self.btn_help.setText(self.t("help"))
         self.btn_license.setText(self.t("license"))
         self.update_install_btn_text()
         self.lbl_lang.setText(self.t("language"))
-        self.lbl_theme.setText(self.t("theme"))
 
         if hasattr(self, "act_show") and hasattr(self, "act_exit"):
             self.act_show.setText(self.t("show"))
@@ -894,12 +1127,9 @@ class MainWindow(QWidget):
         self.update_ready_status()
 
     def apply_theme(self):
-        self.theme = self.dd_theme.currentText()
-        qss = THEMES.get(self.theme, "")
-        app = QApplication.instance()
-        if app:
-            app.setStyleSheet(qss)
-
+        # System styling is always active - no custom stylesheets
+        self.theme = "System"
+        
         data = read_conf()
         data["theme"] = self.theme
         write_conf(data)
@@ -914,21 +1144,39 @@ class MainWindow(QWidget):
             self.mount_point = mp
             if lm.get("iso_path"):
                 self.path_edit.setText(lm.get("iso_path"))
+
+            # Add to mounted ISOs list
+            mount_info = {
+                "iso_path": lm.get("iso_path", ""),
+                "loop_device": self.loop_device,
+                "mount_device": self.mount_device,
+                "mount_point": mp,
+            }
+            self.mounted_isos.append(mount_info)
+
             self.btn_mount.setEnabled(False)
             self.btn_unmount.setEnabled(True)
+            self.btn_open_fm.setEnabled(True)
             self.info(self.t("restored_mount", mp=mp))
 
     # ---------- Readiness & locking ----------
     def has_permission_rules(self):
+        # Check both config and actual file existence
+        # Also check internal state to catch recent changes
         if getattr(self, "_perms_fixed", False):
             return True
-        try:
-            if polkit_rule_present():
-                return True
-        except Exception:
-            pass
+            
         conf = read_conf()
-        return bool(conf.get("polkit_rule"))
+        config_has_rule = bool(conf.get("polkit_rule"))
+        file_exists = polkit_rule_present()
+        
+        # Only return True if both config and file agree
+        result = config_has_rule and file_exists
+        
+        # Update internal state to match
+        self._perms_fixed = result
+        
+        return result
 
     def set_main_enabled(self, enabled: bool):
         for w in [self.path_edit, self.btn_browse, self.drop,
@@ -949,8 +1197,24 @@ class MainWindow(QWidget):
         self.btn_install_toggle.setText(self.t("uninstall") if is_installed() else self.t("install"))
 
     def set_iso_path(self, path):
-        self.path_edit.setText(path)
-        self.status.setText(self.t("selected_iso", path=path))
+        """Set ISO path with validation."""
+        if not path or not isinstance(path, str):
+            self.error(self.t("bad_path"))
+            return
+        
+        try:
+            iso_path = Path(path).resolve()
+            if not iso_path.is_file():
+                self.error(self.t("bad_path"))
+                return
+            if not iso_path.suffix.lower() == '.iso':
+                self.error(self.t("invalid_iso"))
+                return
+            
+            self.path_edit.setText(str(iso_path))
+            self.status.setText(self.t("selected_iso", path=str(iso_path)))
+        except (OSError, ValueError) as e:
+            self.error(self.t("bad_path"))
 
     def browse_iso(self):
         fn, _ = QFileDialog.getOpenFileName(self, self.t("pick_iso_title"), str(Path.home()), self.t("file_filter"))
@@ -977,7 +1241,9 @@ class MainWindow(QWidget):
         menu.addAction(self.act_show)
         menu.addAction(self.act_exit)
         self.act_show.triggered.connect(self.show_from_tray)
-        self.act_exit.triggered.connect(QApplication.instance().quit)
+        app = QApplication.instance()
+        if app:
+            self.act_exit.triggered.connect(app.quit)
         tray.setContextMenu(menu)
         tray.activated.connect(self.on_tray_activated)
         tray.show()
@@ -1010,10 +1276,13 @@ class MainWindow(QWidget):
         mb.setWindowTitle(self.t("license_title"))
         mb.setText(self.t("license_text"))
         btn_open = mb.addButton("Open license", QMessageBox.ButtonRole.AcceptRole)
+        btn_github = mb.addButton("GitHub", QMessageBox.ButtonRole.AcceptRole)
         mb.addButton("Close", QMessageBox.ButtonRole.RejectRole)
         mb.exec()
         if mb.clickedButton() == btn_open:
             open_url(LICENSE_URL)
+        elif mb.clickedButton() == btn_github:
+            open_url("https://github.com/NeleBiH")
 
     # ---------- Install/Uninstall ----------
     def toggle_install(self):
@@ -1042,7 +1311,7 @@ class MainWindow(QWidget):
         ) == QMessageBox.StandardButton.Yes
 
     def on_autostart_changed(self, state):
-        enabled = state == Qt.Checked
+        enabled = state == 2
         exec_path = APP_BIN if is_installed() else Path(__file__).resolve()
         set_autostart(enabled, exec_path)
 
@@ -1050,9 +1319,9 @@ class MainWindow(QWidget):
     def on_fix_permissions(self):
         if self.has_permission_rules():
             self.info(self.t("fixperms_exists"))
-            self.btn_fixperms.setEnabled(False)
-            self.set_main_enabled(True)
             self._perms_fixed = True
+            self._update_permissions_button()
+            self.set_main_enabled(True)
             self.update_ready_status()
             return
 
@@ -1063,12 +1332,20 @@ class MainWindow(QWidget):
             data["polkit_rule"] = True
             write_conf(data)
             self._perms_fixed = True
-            self.btn_fixperms.setEnabled(False)
+            self._update_permissions_button()
             QTimer.singleShot(300, self.update_ready_status)
             self.set_main_enabled(True)
             self.update_ready_status()
+            
+            # Show logout message if groups were added
+            if "groups" in str(err_or_cmd).lower():
+                self.info(self.t("logout_required"))
         else:
-            if "install -m 0644" in err_or_cmd:
+            # err_or_cmd can be a string (error message) or list (manual command)
+            if isinstance(err_or_cmd, list):
+                cmd_str = " ".join(err_or_cmd)
+                self.error(self.t("fixperms_need_pkexec", cmd=cmd_str))
+            elif "install -m 0644" in str(err_or_cmd):
                 self.error(self.t("fixperms_need_pkexec", cmd=err_or_cmd))
             else:
                 self.error(self.t("fixperms_failed", err=err_or_cmd))
@@ -1077,6 +1354,7 @@ class MainWindow(QWidget):
     def do_mount(self):
         if not self.has_permission_rules():
             self.error(self.t("not_ready"))
+            self.error("Please click 'Fix permissions' button first.")
             return
         iso = self.path_edit.text().strip()
         if not iso:
@@ -1099,15 +1377,26 @@ class MainWindow(QWidget):
             self.error(self.t("loop_setup_fail", msg=(err or out)))
             return
 
-        dev = next((t.rstrip(".") for t in out.split() if t.startswith("/dev/loop")), None)
+        # More robust parsing of loop device from udisksctl output
+        dev = None
+        for token in out.split():
+            token = token.strip().rstrip(".;")
+            if token.startswith("/dev/loop") and token.replace("/dev/loop", "").replace("p", "").isdigit():
+                dev = token
+                break
+        
         if not dev:
             self.error(self.t("no_loop_device", out=out))
             return
 
         # Ensure kernel noticed partitions for isohybrid images
+        # These commands may fail without root - that's OK, we capture and ignore errors
         for cmd in (["udevadm","settle"], ["partprobe", dev], ["blockdev","--rereadpt", dev]):
             if shutil.which(cmd[0]):
-                run(cmd, capture=False)
+                try:
+                    run(cmd, capture=True, timeout=5)  # capture=True to suppress error output
+                except (OSError, subprocess.SubprocessError):
+                    pass  # Ignore errors in these helper commands
 
         # Choose mountable device (prefer partition if present)
         mount_dev = pick_mountable_block(dev)
@@ -1130,13 +1419,21 @@ class MainWindow(QWidget):
                 self.error(self.t("mount_fail", msg=(err2 or out2)))
                 return
 
-        # Parse "Mounted /dev/loopX at /run/media/$USER/XXXX."
+        # Parse mount point from udisksctl output (locale-independent)
+        # Output format: "Mounted /dev/loopX at /run/media/$USER/XXXX."
+        # Instead of relying on "at" keyword, look for paths starting with /run or /media
         mp_auto = None
         parts = out2.split()
-        if "at" in parts:
+        for part in parts:
+            cleaned = part.rstrip(".;")
+            if cleaned.startswith(("/run/media/", "/media/", "/mnt/")):
+                mp_auto = cleaned
+                break
+        # Fallback: try "at" keyword for other mount locations
+        if not mp_auto and "at" in parts:
             idx = parts.index("at")
             if idx + 1 < len(parts):
-                mp_auto = parts[idx + 1].rstrip(".")
+                mp_auto = parts[idx + 1].rstrip(".;")
         self.loop_device = dev
         self.mount_device = mount_dev
         self.mount_point = mp_auto or "(unknown)"
@@ -1152,13 +1449,23 @@ class MainWindow(QWidget):
         }
         write_conf(data)
 
+        # Add to mounted ISOs list
+        mount_info = {
+            "iso_path": iso,
+            "loop_device": dev,
+            "mount_device": mount_dev,
+            "mount_point": self.mount_point,
+        }
+        self.mounted_isos.append(mount_info)
+        self._update_mounted_list()
+
+        # Add to recent files
+        add_to_recent_files(iso)
+        self._populate_recent_files()
+
         self.btn_mount.setEnabled(False)
         self.btn_unmount.setEnabled(True)
-
-        # Best-effort refresh for Dolphin/KDE
-        for cmd in (["kioclient5","refresh","/"], ["kioclient6","refresh","/"]):
-            if shutil.which(cmd[0]):
-                run(cmd, capture=False)
+        self.btn_open_fm.setEnabled(True)
 
     def do_unmount(self):
         if not (self.mount_point and self.loop_device):
@@ -1180,11 +1487,16 @@ class MainWindow(QWidget):
             self.error(self.t("loop_delete_fail", msg=err2))
             return
 
+        # Remove from mounted ISOs list
+        self.mounted_isos = [m for m in self.mounted_isos if m.get("loop_device") != dev]
+        self._update_mounted_list()
+
         self.loop_device = None
         self.mount_device = None
         self.mount_point = None
         self.btn_unmount.setEnabled(False)
         self.btn_mount.setEnabled(True)
+        self.btn_open_fm.setEnabled(len(self.mounted_isos) > 0)
         self.info(self.t("unmount_ok"))
 
         data = read_conf()
@@ -1196,7 +1508,172 @@ class MainWindow(QWidget):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
-        self.tray.showMessage(APP_NAME, self.t("tray_running"), QSystemTrayIcon.MessageIcon.Information, 1800)
+        if hasattr(self, 'tray') and self.tray:
+            self.tray.showMessage(APP_NAME, self.t("tray_running"), QSystemTrayIcon.MessageIcon.Information, 1800)
+    
+    def __del__(self):
+        """Cleanup resources when object is destroyed."""
+        try:
+            if hasattr(self, 'blink_timer') and self.blink_timer:
+                self.blink_timer.stop()
+            if hasattr(self, 'tray') and self.tray:
+                self.tray.hide()
+        except Exception:
+            pass  # Ignore cleanup errors
+
+    # ---------- Recent files ----------
+    def _populate_recent_files(self):
+        """Populate recent files dropdown."""
+        # Clear existing items except first
+        while self.dd_recent.count() > 1:
+            self.dd_recent.removeItem(1)
+
+        recent = get_recent_files()
+        for filepath in recent:
+            if Path(filepath).is_file():
+                display_name = Path(filepath).name
+                self.dd_recent.addItem(display_name, filepath)
+
+    def on_recent_selected(self, idx):
+        """Handle recent file selection."""
+        if idx <= 0:
+            return
+        filepath = self.dd_recent.itemData(idx)
+        if filepath and Path(filepath).is_file():
+            self.set_iso_path(filepath)
+        # Reset dropdown to header
+        self.dd_recent.setCurrentIndex(0)
+
+    # ---------- Mounted ISOs list ----------
+    def _update_mounted_list(self):
+        """Update the mounted ISOs list widget."""
+        self.mounted_list.clear()
+        for mount_info in self.mounted_isos:
+            iso_name = Path(mount_info.get("iso_path", "")).name
+            mount_point = mount_info.get("mount_point", "")
+            item_text = f"{iso_name} → {mount_point}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, mount_info)
+            self.mounted_list.addItem(item)
+
+        # Show/hide based on whether there are mounted ISOs
+        has_mounts = len(self.mounted_isos) > 0
+        self.mounted_list.setVisible(has_mounts)
+        self.lbl_mounted.setVisible(has_mounts)
+        self.btn_open_fm.setEnabled(has_mounts)
+
+    def on_mounted_item_selected(self, item):
+        """Handle selection in mounted ISOs list."""
+        mount_info = item.data(Qt.ItemDataRole.UserRole)
+        if mount_info:
+            # Set the path edit to the selected ISO
+            self.path_edit.setText(mount_info.get("iso_path", ""))
+            # Store as current for unmount/open operations
+            self.loop_device = mount_info.get("loop_device")
+            self.mount_device = mount_info.get("mount_device")
+            self.mount_point = mount_info.get("mount_point")
+
+    # ---------- Open in File Manager ----------
+    def open_in_file_manager(self):
+        """Open the current mount point in file manager."""
+        if not self.mount_point:
+            self.error(self.t("no_mount_point"))
+            return
+        if not Path(self.mount_point).exists():
+            self.error(self.t("mount_point_not_exists"))
+            return
+        open_file_manager(self.mount_point)
+        self.info(self.t("opened_in_fm", path=self.mount_point))
+
+    # ---------- Checksum verification ----------
+    def show_checksum(self):
+        """Calculate and display checksum for selected ISO."""
+        iso = self.path_edit.text().strip()
+        if not iso:
+            self.error(self.t("no_iso"))
+            return
+        if not Path(iso).is_file():
+            self.error(self.t("bad_path"))
+            return
+
+        # Create progress dialog
+        progress = QProgressDialog(self.t("calculating_checksum"), self.t("cancel"), 0, 100, self)
+        progress.setWindowTitle(self.t("checksum_title"))
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        cancelled = [False]
+
+        def on_cancel():
+            cancelled[0] = True
+
+        progress.canceled.connect(on_cancel)
+
+        def progress_callback(percent):
+            if cancelled[0]:
+                raise InterruptedError("Cancelled")
+            progress.setValue(percent)
+            QApplication.processEvents()
+
+        try:
+            checksum = calculate_checksum(iso, "sha256", progress_callback)
+            progress.close()
+
+            # Show result dialog
+            msg = QMessageBox(self)
+            msg.setWindowTitle(self.t("checksum_title"))
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText(f"SHA-256:\n{checksum}")
+            msg.setDetailedText(f"File: {iso}\nAlgorithm: SHA-256\nChecksum: {checksum}")
+
+            # Add copy button
+            btn_copy = msg.addButton(self.t("copy"), QMessageBox.ButtonRole.ActionRole)
+            msg.addButton(QMessageBox.StandardButton.Ok)
+            msg.exec()
+
+            if msg.clickedButton() == btn_copy:
+                clipboard = QApplication.clipboard()
+                clipboard.setText(checksum)
+                self.info(self.t("checksum_copied"))
+
+        except InterruptedError:
+            progress.close()
+            self.info(self.t("checksum_cancelled"))
+        except Exception as e:
+            progress.close()
+            self.error(self.t("checksum_error", err=str(e)))
+
+    # ---------- Auto-unmount on exit ----------
+    def on_auto_unmount_changed(self, state):
+        """Handle auto-unmount checkbox change."""
+        self.auto_unmount_on_exit = (state == 2)
+        data = read_conf()
+        data["auto_unmount_on_exit"] = self.auto_unmount_on_exit
+        write_conf(data)
+
+    def _do_auto_unmount(self):
+        """Perform auto-unmount on all mounted ISOs."""
+        if not self.auto_unmount_on_exit:
+            return
+
+        # Unmount all mounted ISOs
+        for mount_info in list(self.mounted_isos):
+            loop_dev = mount_info.get("loop_device")
+            mount_dev = mount_info.get("mount_device", loop_dev)
+
+            if mount_dev and UDISKSCTL:
+                run([UDISKSCTL, "unmount", "-b", mount_dev], capture=False)
+            if loop_dev and UDISKSCTL:
+                run([UDISKSCTL, "loop-delete", "-b", loop_dev], capture=False)
+
+        # Also unmount the single mount if any
+        if self.loop_device:
+            mdev = getattr(self, "mount_device", self.loop_device)
+            if mdev and UDISKSCTL:
+                run([UDISKSCTL, "unmount", "-b", mdev], capture=False)
+            if UDISKSCTL:
+                run([UDISKSCTL, "loop-delete", "-b", self.loop_device], capture=False)
 
     # ---------- Handlers ----------
     def on_language_changed(self, idx):
@@ -1214,6 +1691,10 @@ def run_gui(mount_base: Path):
         sys.exit(1)
     w = MainWindow(mount_base)
     w.setWindowIcon(app_icon())
+
+    # Connect app aboutToQuit signal to auto-unmount
+    app.aboutToQuit.connect(w._do_auto_unmount)
+
     w.show()
     sys.exit(app.exec())
 
