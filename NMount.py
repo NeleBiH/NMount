@@ -407,7 +407,10 @@ def is_installed():
     data = read_conf()
     if data.get("installed") is True:
         files = data.get("files", [])
-        return all(Path(f).exists() for f in files)
+        # Check if at least the main executable exists
+        if files:
+            return any(Path(f).exists() for f in files if f.endswith(('.AppImage', 'nmount')))
+        return False
     return False
 
 # ---------------- Autostart ----------------
@@ -537,13 +540,51 @@ def best_effort_unmount_if_needed():
     elif loop_dev and LOSETUP:
         run([LOSETUP, "-d", loop_dev], capture=False)
 
+# ---------------- AppImage detection ----------------
+def get_real_executable_path() -> Path:
+    """Get the real executable path, handling AppImage case."""
+    appimage_path = os.environ.get("APPIMAGE")
+    if appimage_path and Path(appimage_path).is_file():
+        return Path(appimage_path).resolve()
+    return Path(__file__).resolve()
+
+def is_running_as_appimage() -> bool:
+    """Check if we're running inside an AppImage."""
+    return bool(os.environ.get("APPIMAGE"))
+
+def get_installed_appimage_path() -> Path:
+    """Return the path where we install the AppImage."""
+    return HOME / ".local" / "share" / "nmount" / "NMount.AppImage"
+
+def get_installed_script_path() -> Path:
+    """Return the path where we install the Python script."""
+    return HOME / ".local" / "share" / "nmount" / "NMount.py"
+
 # ---------------- Installer ----------------
 def install_self(mount_base: Path, keep_autostart: bool):
-    """Copy self to ~/.local/bin/nmount, create launcher + Desktop shortcut, persist paths."""
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
-    src = Path(__file__).resolve()
-    dst = APP_BIN
-    
+    """Copy self to ~/.local/share/nmount/, create launcher + Desktop shortcut, persist paths."""
+    src = get_real_executable_path()
+    installed_files = []
+
+    # Determine destination based on whether we're an AppImage or Python script
+    if is_running_as_appimage():
+        # Install AppImage to ~/.local/share/nmount/
+        install_dir = HOME / ".local" / "share" / "nmount"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        dst = get_installed_appimage_path()
+    else:
+        # Install Python scripts to ~/.local/share/nmount/
+        install_dir = HOME / ".local" / "share" / "nmount"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        dst = install_dir / "NMount.py"
+
+        # Also copy translations.py
+        translations_src = Path(__file__).resolve().parent / "translations.py"
+        if translations_src.exists():
+            translations_dst = install_dir / "translations.py"
+            shutil.copy2(translations_src, translations_dst)
+            installed_files.append(str(translations_dst))
+
     # Atomic copy using temporary file
     temp_dst = dst.with_suffix('.tmp')
     try:
@@ -555,6 +596,8 @@ def install_self(mount_base: Path, keep_autostart: bool):
             temp_dst.unlink()
         raise e
 
+    installed_files.append(str(dst))
+
     app_launcher = write_desktop_file(APP_LAUNCHER, dst, make_executable=False)
     try:
         USER_DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
@@ -562,11 +605,13 @@ def install_self(mount_base: Path, keep_autostart: bool):
         pass
     desktop_shortcut = write_desktop_file(DESKTOP_SHORTCUT, dst, make_executable=True)
 
+    installed_files.extend([str(app_launcher), str(desktop_shortcut)])
+
     data = read_conf()
     data.update({
         "installed": True,
         "mount_base": str(mount_base),
-        "files": sorted({str(dst), str(app_launcher), str(desktop_shortcut)} | set(data.get("files", [])))
+        "files": sorted(set(installed_files) | set(data.get("files", [])))
     })
     data.setdefault("language", data.get("language", "en"))
     data.setdefault("theme", data.get("theme", "Light Minimal"))
@@ -610,8 +655,16 @@ def uninstall_self():
         except OSError:
             pass
 
-    # 4) try clean empty dirs
-    for d in (APPS_DIR, BIN_DIR):
+    # 4) try clean empty dirs (including AppImage install dir)
+    install_dir = HOME / ".local" / "share" / "nmount"
+    # Also remove __pycache__ if present
+    pycache_dir = install_dir / "__pycache__"
+    if pycache_dir.exists():
+        try:
+            shutil.rmtree(pycache_dir)
+        except OSError:
+            pass
+    for d in (APPS_DIR, BIN_DIR, install_dir):
         try:
             if d.exists() and not any(d.iterdir()):
                 d.rmdir()
@@ -1713,7 +1766,8 @@ def main():
 
     if args.install:
         install_self(mount_base, keep_autostart=read_conf().get("autostart", False))
-        print(f"Installed to {APP_BIN}\nMenu launcher: {APP_LAUNCHER}\nDesktop shortcut: {DESKTOP_SHORTCUT}\nConfig: {CONF_FILE}")
+        install_path = get_installed_appimage_path() if is_running_as_appimage() else get_installed_script_path()
+        print(f"Installed to {install_path}\nMenu launcher: {APP_LAUNCHER}\nDesktop shortcut: {DESKTOP_SHORTCUT}\nConfig: {CONF_FILE}")
         sys.exit(0)
 
     if args.uninstall:
